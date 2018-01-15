@@ -1,0 +1,930 @@
+<?php
+/**
+ * @file
+ * Code for commerce_custom_refunds module.
+ */
+
+include_once 'commerce_custom_refunds.features.inc';
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_custom_refunds_menu() {
+  $items = array();
+
+  $items['admin/commerce/config/refunds'] = array(
+    'title' => 'Refunds',
+    'description' => 'Administer refund settings.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_custom_refunds_settings_form'),
+    'access arguments' => array('manage refund settings'),
+    'file' => 'includes/commerce_custom_refunds.admin.inc',
+    'type' => MENU_NORMAL_ITEM,
+    'weight' => 0,
+  );
+
+  $items['admin/commerce/orders/%commerce_order/payment/%commerce_payment_transaction/credit-accounts-refund'] = array(
+    'title' => 'Refund',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_custom_refunds_credit_accounts_refund_form', 3, 5),
+    'access callback' => 'commerce_custom_refunds_credit_accounts_refund_access',
+    'access arguments' => array(3, 5),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'context' => MENU_CONTEXT_INLINE,
+    'weight' => 2,
+    'file' => 'includes/commerce_custom_refunds.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_menu_alter().
+ *
+ * Changes Commerce's administrative payment page to a different View.
+ */
+function commerce_custom_refunds_menu_alter(&$items) {
+  $items['admin/commerce/orders/%commerce_order/payment']['page callback'] = 'commerce_custom_refunds_payment_ui_order_tab';
+  $items['admin/commerce/orders/%commerce_order/payment']['file'] = 'includes/commerce_custom_refunds.admin.inc';
+  $items['admin/commerce/orders/%commerce_order/payment']['file path'] = drupal_get_path('module', 'commerce_custom_refunds');
+}
+
+/**
+ * Implements hook_permission().
+ */
+function commerce_custom_refunds_permission() {
+  return array(
+    'manage refund settings' => array(
+      'title' => t('Manage refund settings'),
+      'description' => t('Manage refund-related settings and properties.'),
+    ),
+  );
+}
+
+/**
+ * Rules condition callback for commerce_custom_refunds_order_balance_vs_total condition.
+ * Compares order balance with order total to see if order is partially or fully refunded.
+ */
+function commerce_custom_refunds_order_balance_vs_total(EntityDrupalWrapper $order_wrapper) {
+  if (empty($order_wrapper->commerce_order_total)) {
+    return;
+  }
+
+  $balance = commerce_payment_order_balance($order_wrapper->value());
+
+  // If balance is greater than or equal to order total, order is fully refunded.
+  if ($balance['amount'] >= $order_wrapper->commerce_order_total->amount->value()) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Determines access to the refund form for credit account transactions.
+ *
+ * @param $order
+ *   The order the transaction is on.
+ * @param $transaction
+ *   The payment transaction object to be refunded.
+ *
+ * @return
+ *   TRUE or FALSE indicating refund access.
+ */
+function commerce_custom_refunds_credit_accounts_refund_access($order, $transaction) {
+  // Return FALSE if the transaction isn't for PayPal.
+  if ($transaction->payment_method != 'credit_accounts' || $transaction->status != 'success' || $transaction->amount <= 0) {
+    return FALSE;
+  }
+
+  // Return FALSE if it is more than 120 days past the order payment.
+  if (REQUEST_TIME - $transaction->created > 86400 * 120) {
+    return FALSE;
+  }
+
+  // Validate if transaction has already been completely refunded.
+  if (!empty($transaction->data['refunds'])) {
+    $max_refund_amount = $transaction->amount;
+
+    foreach ($transaction->data['refunds'] as $refund_transaction_id => $refund_transaction_amount) {
+      $max_refund_amount += $refund_transaction_amount;
+    }
+
+    if ($max_refund_amount <= 0) {
+      return FALSE;
+    }
+  }
+
+  // Allow access if the user can update payments on this transaction.
+  return commerce_payment_transaction_access('update', $transaction);
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ *
+ * This adds a payment type for handling store credit refunds.
+ */
+function commerce_custom_refunds_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['store_credit_refund'] = array(
+    'base' => 'commerce_custom_refunds',
+    'title' => t('Store credit refund'),
+    'display_title' => t('Apply a store credit refund to a transaction.'),
+    'description' => t('Apply a store credit refund to a transaction.'),
+    'active' => FALSE,
+    'fieldable' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Implementation of hook_default_rules_configuration_alter().
+ *
+ * Used to disable the rules components for this payment method, since only
+ * the system will be using it.
+ */
+function commerce_custom_refunds_default_rules_configuration_alter(&$configs) {
+  if (isset($configs['commerce_payment_store_credit_refund'])) {
+    $configs['commerce_payment_store_credit_refund']->active = FALSE;
+  }
+}
+
+/**
+ * Form alter to handle changes to the Paypal WPP refund form.
+ *
+ * @see commerce_paypal_wpp_refund_form()
+ */
+function commerce_custom_refunds_form_commerce_paypal_wpp_refund_form_alter(&$form, &$form_state, $form_id) {
+  $transaction = $form_state['transaction'];
+  $order = $form_state['order'];
+
+  $form = commerce_custom_refunds_refund_form_items($form, $transaction, $order);
+
+  // Prevents multiple submissions of the refund form.
+  $form['actions']['submit']['#attributes'] = array(
+    'onclick' => commerce_custom_refunds_form_onclick_js_disable(),
+  );
+
+  // Override and replace the existing form validation.
+  $form['#validate'] = array('commerce_custom_refunds_refund_form_validate');
+  $form['#submit'] = array('commerce_custom_refunds_refund_form_submit');
+}
+
+/**
+ * Form alter to handle changes to the Paypal EC refund form.
+ *
+ * @see commerce_paypal_ec_refund_form()
+ */
+function commerce_custom_refunds_form_commerce_paypal_ec_refund_form_alter(&$form, &$form_state, $form_id) {
+  $transaction = $form_state['transaction'];
+  $order = $form_state['order'];
+
+  // Get max refund amount available based on other refunds.
+  $max_refund_amount = $transaction->amount;
+  if (!empty($transaction->data['refunds'])) {
+    foreach ($transaction->data['refunds'] as $refund_transaction_id => $refund_transaction_amount) {
+      $max_refund_amount += $refund_transaction_amount;
+    }
+  }
+  $form_state['max_refund_amount'] = $max_refund_amount;
+
+  $form = commerce_custom_refunds_refund_form_items($form, $transaction, $order);
+
+  // Prevents multiple submissions of the refund form.
+  $form['actions']['submit']['#attributes'] = array(
+    'onclick' => commerce_custom_refunds_form_onclick_js_disable(),
+  );
+
+  // Override and replace the existing form validation.
+  $form['#validate'] = array('commerce_custom_refunds_refund_form_validate');
+  $form['#submit'] = array('commerce_custom_refunds_refund_form_submit');
+}
+
+/**
+ * Provides the standard form elements used for refund forms on the
+ * various payment types.
+ *
+ * @param array $form
+ *   Nested array of form elements that comprise the form.
+ * @param object $transaction
+ *   A loaded Commerce transaction object.
+ * @param object $order
+ *   A loaded Commerce order object.
+ *
+ * @return $form
+ *   Modified array of form elements that comprise the form.
+ */
+function commerce_custom_refunds_refund_form_items(&$form, $transaction, $order) {
+  $line_items_list = commerce_custom_refunds_get_order_line_items_for_select($order);
+
+  $balance = commerce_payment_order_balance($order);
+
+  // Convert the balance to the transaction currency.
+  if ($balance['currency_code'] != $transaction->currency_code) {
+    $balance['amount'] = commerce_currency_convert($balance['amount'], $balance['currency_code'], $transaction->currency_code);
+    $balance['currency_code'] = $transaction->currency_code;
+  }
+
+  if ($balance['amount'] > 0 && $balance['amount'] < $transaction->amount) {
+    $default_amount = $transaction->amount - $balance['amount'];
+  }
+  else {
+    $default_amount = $transaction->amount;
+  }
+
+  // Convert the price amount to a user friendly decimal value.
+  $default_amount = number_format(commerce_currency_amount_to_decimal($default_amount, $transaction->currency_code), 2, '.', '');
+
+  $description = implode('<br />', array(
+    t('Authorization: @amount', array('@amount' => commerce_currency_format($transaction->amount, $transaction->currency_code))),
+    t('Order balance: @balance', array('@balance' => commerce_currency_format($balance['amount'], $balance['currency_code']))),
+  ));
+
+  // Removing the structure of the original form.
+  unset($form['amount']);
+
+  $form['refund_choices'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('What amount do you want to refund?'),
+    '#description' => '',
+  );
+
+  // Creates three different options for handling refunds.
+  $form['refund_choices']['refund_amount'] = array(
+    '#type' => 'item',
+    '#title' => '',
+    '#description' => '',
+  );
+
+  $form['refund_choices']['refund_amount']['all'] = array(
+    '#type' => 'radio',
+    '#title' => t('Refund the full amount.'),
+    '#default_value' => 1,
+    '#default' => 1,
+    '#return_value' => 1,
+    '#parents' => array('refund_amount'),
+    '#prefix' => '',
+  );
+
+  $form['refund_choices']['refund_amount']['line_item'] = array(
+    '#type' => 'radio',
+    '#title' => t('Refund a specific line item only.'),
+    '#default_value' => 1,
+    '#default' => 1,
+    '#return_value' => 2,
+    '#parents' => array('refund_amount'),
+    '#prefix' => '',
+  );
+
+  $form['refund_choices']['refund_amount']['line_item_choice'] = array(
+    '#type' => 'select',
+    '#title' => t('Line items:'),
+    '#description' => '',
+    '#default_value' => '',
+    '#options' => $line_items_list,
+    '#states' => array(
+      'visible' => array(
+        ':input[name="refund_amount"]' => array('value' => 2),
+      ),
+    ),
+  );
+
+  $form['refund_choices']['refund_amount']['no_item'] = array(
+    '#type' => 'radio',
+    '#title' => t('Specify a refund amount.'),
+    '#default_value' => 1,
+    '#default' => 1,
+    '#return_value' => 3,
+    '#parents' => array('refund_amount'),
+    '#prefix' => '',
+  );
+
+  $form['refund_choices']['refund_amount']['amount_choice'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Refund amount'),
+    '#description' => $description,
+    '#default_value' => $default_amount,
+    '#field_suffix' => check_plain($transaction->currency_code),
+    '#size' => 16,
+    '#states' => array(
+      'visible' => array(
+        ':input[name="refund_amount"]' => array('value' => 3),
+      ),
+    ),
+  );
+
+  // Add an entry to the beginning of the line item list for not choosing
+  // any line items.
+  array_unshift($line_items_list, t('Do not apply to any line items.'));
+
+  $form['refund_choices']['refund_amount']['amount_choice_line_item'] = array(
+    '#type' => 'select',
+    '#title' => t('Line items:'),
+    '#description' => t('If you wish to apply this refund to a specific line item, choose it here. For refunding situations like a double-charge, do not apply it to any line items.'),
+    '#default_value' => 0,
+    '#options' => $line_items_list,
+    '#states' => array(
+      'visible' => array(
+        ':input[name="refund_amount"]' => array('value' => 3),
+      ),
+    ),
+  );
+
+  $form['payment'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Refund method'),
+    '#description' => '',
+  );
+
+  $form['payment']['payment_method'] = array(
+    '#type' => 'radios',
+    '#title' => t('How would you like to issue this refund?'),
+    '#options' => array(
+      'paypal' => t('Paypal'),
+      'credit' => t('Store credit'),
+    ),
+    '#description' => '',
+    '#default_value' => 'paypal',
+  );
+
+  // @TODO: This section needs replaced for contrib use.
+  $registrations = commerce_registration_get_registrations($order);
+
+  // Only show an option to remove from the activity if there
+  // are registrations in the order.
+  if (isset($registrations)) {
+    $activities = array();
+
+    // Gather some activity data for each of the registrations, and compare that
+    // to the user's memberships.
+    foreach ($registrations as $registration) {
+      $activity = commerce_registration_get_registration_product_activity($registration);
+      $activity_id = $activity->getIdentifier();
+
+      // Gather the user's groups.
+      if ($memberships = GroupMembership::getByActiveStatus($order->uid)) {
+        foreach ($memberships as $group_membership) {
+          $group = commerce_custom_refunds_get_membership_parent($group_membership);
+          if (isset($group->gid)) {
+            $gid = $group->gid->value();
+            if ($gid == $activity_id) {
+              // Be careful when observing this, the gid is
+              // the membership gid, not the activity gid.
+              // We will be using this later on to easily process
+              // removal of the group_membership.
+              $activities[$group_membership->mid] = $activity->title->value();
+            }
+          }
+        }
+      }
+    }
+
+    // No point in showing this option if memberships are already removed and/or
+    // there is nothing to display.
+    if (!empty($activities)) {
+      // Using union operator here instead of merge/unshifting, since the latter would
+      // reset array keys.
+      $activities = array(0 => t('All activities')) + $activities;
+
+      $form['remove'] = array(
+        '#type' => 'fieldset',
+        '#title' => t('Do you want to remove the user from activities related to this order?'),
+        '#description' => '',
+      );
+
+      $form['remove']['remove_from_activity'] = array(
+        '#type' => 'checkbox',
+        '#title' => t('Remove this player?'),
+        '#default_value' => 0,
+      );
+
+      $form['remove']['remove_line_item'] = array(
+        '#type' => 'select',
+        '#title' => t('Remove from a specific activity, or all activities?'),
+        '#description' => t('Choose a specific registration line item to only remove the user from that activity. Otherwise, the user will be removed from all activities on this order.'),
+        '#default_value' => 0,
+        '#options' => $activities,
+      );
+    }
+  }
+
+  // Gather refund reasons.
+  $reasons = array();
+  $vocabulary = taxonomy_vocabulary_machine_name_load('refund_reasons');
+  $reasons_terms = entity_load('taxonomy_term', FALSE, array('vid' => $vocabulary->vid));
+  foreach ($reasons_terms as $reasons_term) {
+    $reasons[$reasons_term->tid] = $reasons_term->name;
+  }
+
+  $form['refund_reason'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Refund Information'),
+    '#description' => '',
+  );
+
+  $form['refund_reason']['category'] = array(
+    '#type' => 'select',
+    '#title' => t('Refund reason'),
+    '#options' => $reasons,
+  );
+  $form['refund_reason']['description'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Refund description'),
+    '#description' => t('Please provide some further detail on the reason for the refund.'),
+    '#required' => TRUE,
+  );
+
+  return $form;
+}
+
+/**
+ * Validation handler for the refund form.
+ *
+ * @see commerce_paypal_wpp_capture_form_validate()
+ */
+function commerce_custom_refunds_refund_form_validate($form, &$form_state) {
+  $transaction = $form_state['transaction'];
+
+  // Process the form entry to find the refund amount.
+  $amounts = _commerce_custom_refunds_process_refund_amount($form_state);
+
+  // There can be multiple amounts. This processes validation for each one.
+  foreach ($amounts as $line_item_id => $amount) {
+    // Remove any zero amounts, as we don't want to process transactions for them.
+    if ($amount == 0) {
+      unset($amounts[$line_item_id]);
+      continue;
+    }
+
+    // Ensure a positive numeric amount has been entered for refund.
+    if (!is_numeric($amount) || $amount <= 0) {
+      form_set_error('refund_amount', t('You must specify a positive numeric amount to refund.'));
+    }
+
+    // Ensure the amount is less than or equal to the payment amount.
+    if ($amount > commerce_currency_amount_to_decimal($form_state['max_refund_amount'], $transaction->currency_code)) {
+      form_set_error('refund_amount', t('You cannot refund more than you paid through Paypal.'));
+    }
+
+    // If the refund period has expired, display an error message and redirect.
+    if (time() - $transaction->created > 86400 * 30) {
+      drupal_set_message(t('This transaction has passed its 30 day limit and cannot be refunded.'), 'error');
+      drupal_goto('admin/commerce/orders/' . $form_state['order']->order_id . '/payment');
+    }
+  }
+
+  if (empty($amounts)) {
+    // This occurs if only one line item was chosen, but it was for a zero amount.
+    // Return a relevant error to the situation.
+    form_set_error('refund_amount', t('Please choose a non-zero line item to refund.'));
+  }
+  else {
+    $form_state['validated_amounts'] = $amounts;
+  }
+}
+
+/**
+ * Submission handler for the refund form.
+ *
+ * @see commerce_paypal_wpp_capture_form_submit()
+ */
+function commerce_custom_refunds_refund_form_submit($form, &$form_state) {
+  $transaction = $form_state['transaction'];
+  $order = $form_state['order'];
+  $default_amount = number_format(commerce_currency_amount_to_decimal($transaction->amount, $transaction->currency_code), 2, '.', '');
+
+  // Because the IPN request sent in synchronous to this form needs to load the
+  // order at the same time we are obliged to release the lock to avoid a
+  // timeout error.
+  entity_get_controller('commerce_order')->resetCache(array($order->order_id));
+
+  // Load and store the payment method instance for this transaction.
+  $payment_method = commerce_payment_method_instance_load($transaction->instance_id);
+
+  // Only process if an amount actually exists.
+  if (!empty($form_state['validated_amounts'])) {
+    $amounts = $form_state['validated_amounts'];
+
+    // Handles the separation of logic between regular Paypal
+    // refunds or store credit refunds.
+    switch ($form_state['values']['payment_method']) {
+
+      // Paypal refund.
+      case 'paypal':
+
+        // Process each refund amount if more than one exists.
+        foreach ($amounts as $line_item_id => $amount) {
+          $nvp = array(
+            'METHOD' => 'RefundTransaction',
+            'TRANSACTIONID' => $transaction->remote_id,
+            'AMT' => $amount,
+            'REFUNDTYPE' => $default_amount - $amount ? 'Partial' : 'Full',
+          );
+
+          // Submit the capture request request to PayPal.
+          $response = commerce_paypal_api_request($payment_method, $nvp, $order);
+
+          switch ($response['ACK']) {
+            case 'SuccessWithWarning':
+            case 'Success':
+              drupal_set_message(t('Prior authorization refunded successfully.'));
+
+              // Process refund.
+              $transaction = commerce_custom_refunds_process_refund_transaction($form_state, $payment_method['method_id'], $line_item_id, $amount, $response);
+
+              break;
+
+            default:
+              // Display an error message but leave the transaction pending.
+              drupal_set_message(t('Refund failed, so the transaction will remain in a pending status.'), 'error');
+              drupal_set_message(check_plain($response['L_LONGMESSAGE0']), 'error');
+              $transaction->payload[REQUEST_TIME . '-refund'] = $response;
+          }
+        }
+        break;
+
+      // Store credit/coupon refund.
+      case 'credit':
+        $coupon_total = 0;
+
+        // Add the amounts together so we only have to issue one coupon for the overall total.
+        // The transactions have to be processed after the coupon is generated so we have some
+        // coupon info to include in the transaction result messages.
+        foreach ($amounts as $amount) {
+          $coupon_total += $amount;
+        }
+
+        // Set up store credit using giftcard_coupons.
+        $coupon = commerce_coupon_create('giftcard_coupon');
+        $coupon->code = commerce_coupon_generate_coupon_code('commerce_giftcard');
+        $coupon->commerce_gc_value[LANGUAGE_NONE][0] = array(
+          'amount' => commerce_currency_decimal_to_amount((string) $coupon_total, commerce_default_currency()),
+          'currency_code' => commerce_default_currency(),
+        );
+        $coupon->commerce_coupon_recipient[LANGUAGE_NONE][0]['target_id'] = $order->uid;
+
+        // Set a specific name. This will show up in various places to identify the type of credit.
+        $coupon->commerce_gc_name[LANGUAGE_NONE][0]['value'] = t('Store credit');
+
+        // Set default timezone.
+        $timezone = date_default_timezone(FALSE);
+
+        // Apply a from date to activate the credit immediately.
+        $coupon->field_coupon_valid_from[LANGUAGE_NONE][0] = array(
+          'value' => format_date(strtotime('now'), 'custom', 'Y-m-d H:i:s', $timezone),
+          'timezone' => $timezone,
+          'timezone_db' => $timezone,
+          'offset' => NULL,
+          'date_type' => 'datetime'
+        );
+        commerce_coupon_save($coupon);
+
+        // Finally, process transactions per amount.
+        foreach ($amounts as $line_item_id => $amount) {
+          // Process refund.
+          $transaction = commerce_custom_refunds_process_refund_transaction($form_state, 'store_credit_refund', $line_item_id, $amount, NULL, $coupon);
+        }
+
+        break;
+
+      // This is for credit account refunds.
+      case 'accounts':
+        foreach ($amounts as $line_item_id => $amount) {
+          // Process refund.
+          $transaction = commerce_custom_refunds_process_refund_transaction($form_state, 'credit_accounts', $line_item_id, $amount);
+        }
+        break;
+    }
+
+    // Process removal from activities if option is selected.
+    if (!empty($form_state['values']['remove_from_activity'])) {
+      $removed = FALSE;
+
+      if ($form_state['values']['remove_line_item'] == 0) {
+        // Process removal from all activities related to the order.
+        $removed = commerce_custom_refunds_remove_activity_memberships($order);
+        drupal_set_message(t('User has been removed from all activities related to this order.'));
+        $transaction->message .= '<br /><b>' . t('User has been removed from all activities in this order.') . '</b>';
+      }
+      else {
+        // A group membership id was passed, only process removal from that group.
+        $group = commerce_custom_refunds_get_membership_parent($form_state['values']['remove_line_item']);
+        if ($group) {
+          $title = $group->label();
+          $gid = $group->getIdentifier();
+          drupal_set_message(t('User has been removed from: @title.', array('@title' => $title)));
+          $transaction->message .= '<br /><b>' . t('User has been removed from: @title (gid: @gid).', array('@title' => $title, '@gid' => $gid)) . '</b>';
+          $removed = commerce_custom_refunds_remove_activity_memberships($order, $form_state['values']['remove_line_item']);
+        }
+      }
+
+      // If not removed, display a relevant message.
+      if (!$removed) {
+        drupal_set_message(t('No active activity memberships were found to remove the user from.'));
+      }
+    }
+
+    commerce_payment_transaction_save($transaction);
+    rules_invoke_all('commerce_custom_refunds_refund_transaction_is_processed', $order, $transaction);
+  }
+
+  $form_state['redirect'] = 'admin/commerce/orders/' . $form_state['order']->order_id . '/payment';
+}
+
+/**
+ * Main function for processing various types of refund transactions.
+ *
+ * @param array $form_state
+ *   A keyed array containing the current state of the form. The arguments that drupal_get_form()
+ *   was originally called with are available in the array $form_state['build_info']['args'].
+ * @param string $type
+ *   The machine name representing the transaction type.
+ * @param int $line_item_id
+ *   An integer representing a line item id.
+ * @param float $amount
+ *   The amount to process for the transaction.
+ * @param array $response
+ *   A keyed array containing the response values from commerce_paypal_api_request().
+ * @param object $coupon
+ *   A loaded object representing coupon values.
+ *
+ * @return $transaction
+ *   An object containing values from the original transaction the refund was related to.
+ */
+function commerce_custom_refunds_process_refund_transaction(&$form_state, $type, $line_item_id, $amount, $response = NULL, $coupon = NULL) {
+  $transaction = $form_state['transaction'];
+  $order = $form_state['order'];
+
+  // Load and store the payment method instance for this transaction.
+  $payment_method = commerce_payment_method_instance_load($transaction->instance_id);
+
+  // Add refund transaction.
+  $refund_transaction = commerce_payment_transaction_new($type, $order->order_id);
+  $refund_transaction->instance_id = $payment_method['instance_id'];
+  $refund_transaction->amount = -commerce_currency_decimal_to_amount($amount, $transaction->currency_code);
+  $refund_transaction->currency_code = $transaction->currency_code;
+  // Response values are only available for refunds through Paypal.
+  if (isset($response)) {
+    $refund_transaction->payload[REQUEST_TIME] = $response;
+    $refund_transaction->remote_id = $response['REFUNDTRANSACTIONID'];
+  }
+  $refund_transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+
+  // There will only be a remote id for Paypal transactions.
+  if (!empty($transaction->remote_id)) {
+    $refund_transaction->message = t('Refund for transaction #@transaction_id', array('@transaction_id' => $transaction->remote_id));
+  }
+  else {
+    $refund_transaction->message = t('Transaction refund issued.');
+  }
+
+  // Add a message that includes some coupon information.
+  if (isset($coupon)) {
+    $refund_transaction->message .= '<br /><b>' . t('Store credit has been issued to <a href="/admin/commerce/coupons/@id/edit">@coupon</a>.', array('@id' => $coupon->coupon_id, '@coupon' => $coupon->code)) . '</b>';
+  }
+
+  // Add refund info to the transaction entity.
+  if (!empty($line_item_id)) {
+    $refund_transaction->field_refunded_line_item[LANGUAGE_NONE][0]['line_item_id'] = $line_item_id;
+  }
+  if (!empty($form_state['values']['category'])) {
+    $refund_transaction->field_refund_reason[LANGUAGE_NONE][0]['tid'] = $form_state['values']['category'];
+  }
+  if (!empty($form_state['values']['description'])) {
+    $refund_transaction->field_refund_explanation[LANGUAGE_NONE][0]['value'] = $form_state['values']['description'];
+  }
+
+  commerce_payment_transaction_save($refund_transaction);
+
+  // Add original transaction message
+  if (empty($transaction->data['refunds']))
+    $transaction->message .= '<br /><b>' . t('Partial or full payment refund(s) has been issued.') . '</b>';
+
+  // Add refund transaction id and amounts to original transaction data.
+  $transaction->data['refunds'][$refund_transaction->transaction_id] = $refund_transaction->amount;
+
+  if (isset($response)) {
+    // Note the capture in the transaction message.
+    $transaction->payload[REQUEST_TIME . '-refund'] = t('Refund - Transaction #@transaction_id - Amount: @amount', array(
+      '@transaction_id' => $response['REFUNDTRANSACTIONID'],
+      '@amount' => commerce_currency_format($refund_transaction->amount, $transaction->currency_code)
+    ));
+  }
+
+  return $transaction;
+}
+
+/**
+ * Removes all activity memberships the user has via registrations
+ * present on a given order.
+ *
+ * @param object $order
+ *   A loaded Commerce order object.
+ * @param int $group_membership_id
+ *   A numerical identifier for a specific group_membership.
+ *
+ * @return boolean $removed
+ *   Returns true if the user was removed from a group. Returns
+ *   false if no memberships were found.
+ */
+function commerce_custom_refunds_remove_activity_memberships($order, $group_membership_id = NULL) {
+  $activities = array();
+  $removed = FALSE;
+
+  // Only process a removal from a specific group membership.
+  if (isset($group_membership_id)) {
+    $membership_wrapper = entity_metadata_wrapper('group_membership', $group_membership_id);
+    if (isset($membership_wrapper)) {
+      $membership = $membership_wrapper->value();
+      $membership->delete();
+      $removed = TRUE;
+    }
+  }
+  else {
+    // Get a list of the activity group ids related to the order to compare
+    // memberships against.
+    $registrations = commerce_registration_get_registrations($order);
+    if (!empty($registrations)) {
+      foreach ($registrations as $registration) {
+        $activity = commerce_registration_get_registration_product_activity($registration);
+        $activities[] = $activity->getIdentifier();
+      }
+    }
+
+    // Gather the user's groups.
+    if ($memberships = GroupMembership::getByActiveStatus($order->uid)) {
+      foreach ($memberships as $group_membership) {
+        $group = commerce_custom_refunds_get_membership_parent($group_membership);
+        if (isset($group->gid)) {
+          $gid = $group->gid->value();
+          if (in_array($gid, $activities)) {
+            // Group matched, removing membership.
+            $group_membership->delete();
+            $removed = TRUE;
+          }
+        }
+      }
+    }
+  }
+
+  return $removed;
+}
+
+/**
+ * Grabs all line items an returns them in an array keyed
+ * by their line item id. Meant to be used for an options
+ * array in form select lists.
+ *
+ * @param object $order
+ *   A loaded order object.
+ * @return
+ *   Returns an array of line items for a given order keyed
+ *   by their line item id.
+ */
+function commerce_custom_refunds_get_order_line_items_for_select($order) {
+  $line_items = NULL;
+  $line_item_options = array();
+  $line_item_title = '';
+  $quantity = 1;
+
+  // Defining a base total here in case none is found in the entity wrapper.
+  // This shouldn't happen, but it's best to be safe.
+  $line_item_total = array(
+    'amount' => 0,
+    'currency_code' => commerce_default_currency(),
+  );
+
+  $line_items = commerce_custom_refunds_get_line_items($order);
+
+  if (isset($line_items)) {
+    foreach ($line_items as $line_item_wrapper) {
+
+      // Grab the title.
+      if (isset($line_item_wrapper->commerce_product)) {
+        $line_item_title = $line_item_wrapper->commerce_product->title->value();
+      }
+
+      // Grab the line item amount.
+      if (isset($line_item_wrapper->commerce_total)) {
+        $line_item_total = $line_item_wrapper->commerce_total->value();
+      }
+
+      // Grab the quantity.
+      if (isset($line_item_wrapper->quantity)) {
+        $quantity = $line_item_wrapper->quantity->value();
+      }
+
+      // Build select list line item array.
+      $line_item_options[$line_item_wrapper->getIdentifier()] = t('@title x@qty - @price', array('@title' => $line_item_title, '@qty' => $quantity, '@price' => commerce_currency_format($line_item_total['amount'], $line_item_total['currency_code'])));
+    }
+  }
+
+  return $line_item_options;
+}
+
+/**
+ * Processes the values of the refund form in order to determine
+ * refund amounts.
+ *
+ * @param array $form_state
+ *   The Drupal form state array.
+ *
+ * @return $amounts
+ *   Retuns an array of amounts keyed by their line item id, or 0 if
+ *   the amount is not specific to any line items.
+ */
+function _commerce_custom_refunds_process_refund_amount(&$form_state) {
+  $amounts = array();
+
+  // Perform different refund actions depending on the form
+  // selection the user made.
+  switch ($form_state['values']['refund_amount']) {
+
+    // Refund full amount and attribute to all line items. Note that
+    // $0 line items will not create a new refund transaction and will
+    // be ignored.
+    case 1:
+      // Get each of the line item totals.
+      $line_items = commerce_custom_refunds_get_line_items($form_state['order']);
+      if (isset($line_items)) {
+        foreach ($line_items as $line_item_wrapper) {
+          if (isset($line_item_wrapper->commerce_total)) {
+            $total = $line_item_wrapper->commerce_total->value();
+            $amounts[$line_item_wrapper->getIdentifier()] = commerce_currency_amount_to_decimal($total['amount'], $total['currency_code']);
+          }
+        }
+      }
+      break;
+
+    // Only refund a specific line item.
+    case 2:
+      // Gather the line item selection from the form, then get a total.
+      $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $form_state['values']['line_item_choice']);
+      if ($line_item_wrapper->commerce_total) {
+        $total = $line_item_wrapper->commerce_total->value();
+        $amounts[$line_item_wrapper->getIdentifier()] = commerce_currency_amount_to_decimal($total['amount'], $total['currency_code']);
+      }
+      break;
+
+    // Specifying a custom amount not applied to any line items.
+    case 3:
+      $amounts[$form_state['values']['amount_choice_line_item']] = $form_state['values']['amount_choice'];
+      break;
+  }
+
+  return $amounts;
+}
+
+/**
+ * Returns the line items on an order, if any.
+ *
+ * @param object $order
+ *   A loaded order object.
+ *
+ * @return EntityDrupalWrapper $line_items
+ *   Returns a wrapper of order line items.
+ */
+function commerce_custom_refunds_get_line_items($order) {
+  $line_items = NULL;
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  if (isset($order_wrapper->commerce_line_items)) {
+    $line_items = $order_wrapper->commerce_line_items;
+  }
+
+  return $line_items;
+}
+
+/**
+ * Gathers the parent group of a given membership.
+ *
+ * @param object|int $group_membership
+ *   A loaded group membership object, or int value representing
+ *   the group membership's unique id.
+ *
+ * @param EntityDrupalWrapper $group
+ *   A loaded entity wrapper for the parent group.
+ */
+function commerce_custom_refunds_get_membership_parent($group_membership) {
+  $group = NULL;
+
+  $membership_wrapper = entity_metadata_wrapper('group_membership', $group_membership);
+  if (isset($membership_wrapper->group)) {
+    $group = $membership_wrapper->group;
+  }
+
+  return $group;
+}
+
+/**
+ * Used to populate a form element's attribute onclick
+ * property for some javascript that prevents multliple clicks.
+ *
+ * @return
+ *   Returns a string of javascript.
+ */
+function commerce_custom_refunds_form_onclick_js_disable() {
+  return 'javascript:var s=this;setTimeout(function(){s.value="Saving...";s.disabled=true;},1);';
+}

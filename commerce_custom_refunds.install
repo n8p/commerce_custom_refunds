@@ -1,0 +1,192 @@
+<?php
+
+/**
+ * @file
+ * Install, update, and uninstall functions for the Commerce Custom Refunds module.
+ */
+
+/**
+ * Implements hook_install().
+ */
+function commerce_custom_refunds_install() {
+
+  $bundle_names = array('store_credit_refund', 'credit_accounts', 'paypal_wpp', 'paypal_ec');
+
+  // Declare field bases.
+  if (!field_info_field('field_refunded_line_item')) {
+    $field = array(
+      'translatable' => '0',
+      'settings' => array(),
+      'field_name' => 'field_refunded_line_item',
+      'type' => 'commerce_line_item_reference',
+      'active' => '1',
+      'locked' => '0',
+      'cardinality' => '1',
+    );
+    field_create_field($field);
+  }
+
+  if (!field_info_field('field_refund_reason')) {
+    $field = array(
+      'translatable' => '0',
+      'settings' => array(
+        'allowed_values' => array(
+          0 => array(
+            'vocabulary' => 'refund_reasons',
+            'parent' => '0',
+          ),
+        ),
+      ),
+      'field_name' => 'field_refund_reason',
+      'type' => 'taxonomy_term_reference',
+      'active' => '1',
+      'locked' => '0',
+      'cardinality' => '1',
+    );
+    field_create_field($field);
+  }
+
+  if (!field_info_field('field_refund_explanation')) {
+    $field = array(
+      'translatable' => '0',
+      'settings' => array(),
+      'field_name' => 'field_refund_explanation',
+      'type' => 'text_long',
+      'active' => '1',
+      'locked' => '0',
+      'cardinality' => '1',
+    );
+    field_create_field($field);
+  }
+
+  // Declare field instances.
+  foreach ($bundle_names as $bundle_name) {
+
+    // For field_refunded_line_item.
+    if (!field_info_instance('commerce_payment_transaction', 'field_refunded_line_item', $bundle_name)) {
+      $instance = array(
+        'label' => 'Refunded line item',
+        'widget' => array(
+          'weight' => '1',
+          'type' => 'inline_entity_form_single',
+          'active' => 1,
+          'settings' => array(
+            'fields' => array(),
+            'type_settings' => array(
+              'allow_new' => 0,
+              'allow_existing' => FALSE,
+              'match_operator' => 'CONTAINS',
+              'allow_clone' => 0,
+              'delete_references' => 1,
+              'override_labels' => 0,
+              'label_singular' => 'line item',
+              'label_plural' => 'line items',
+            ),
+          ),
+        ),
+        'settings' => array(
+          'user_register_form' => FALSE,
+        ),
+        'display' => array(
+          'default' => array(
+            'label' => 'above',
+            'type' => 'commerce_line_item_reference_view',
+            'settings' => array(
+              'view' => 'commerce_line_item_table|default',
+            ),
+            'weight' => 0,
+          ),
+        ),
+        'required' => 0,
+        'description' => 'The line item that was refunded for this transaction.',
+        'field_name' => 'field_refunded_line_item',
+        'entity_type' => 'commerce_payment_transaction',
+        'bundle' => $bundle_name,
+      );
+      field_create_instance($instance);
+    }
+
+    // For field_refund_reason.
+    if (!field_info_instance('commerce_payment_transaction', 'field_refund_reason', $bundle_name)) {
+      $instance = array(
+        'label' => 'Refund reason',
+        'widget' => array(
+          'weight' => '2',
+          'type' => 'options_select',
+          'active' => 1,
+          'settings' => array(
+            'apply_chosen' => '',
+          ),
+        ),
+        'settings' => array(
+          'user_register_form' => FALSE,
+        ),
+        'display' => array(
+          'default' => array(
+            'label' => 'above',
+            'type' => 'taxonomy_term_reference_link',
+            'settings' => array(),
+            'weight' => 1,
+          ),
+        ),
+        'required' => 0,
+        'description' => 'Choose a reason why this transaction was refunded.',
+        'default_value' => NULL,
+        'field_name' => 'field_refund_reason',
+        'entity_type' => 'commerce_payment_transaction',
+        'bundle' => $bundle_name,
+      );
+      field_create_instance($instance);
+    }
+
+    // For field_refund_explanation.
+    if (!field_info_instance('commerce_payment_transaction', 'field_refund_explanation', $bundle_name)) {
+      $instance = array(
+        'label' => 'Refund explanation',
+        'widget' => array(
+          'weight' => '3',
+          'type' => 'text_textarea',
+          'active' => 1,
+          'settings' => array(
+            'rows' => '5',
+          ),
+        ),
+        'settings' => array(
+          'text_processing' => '0',
+          'user_register_form' => FALSE,
+        ),
+        'display' => array(
+          'default' => array(
+            'label' => 'above',
+            'type' => 'text_default',
+            'settings' => array(),
+            'weight' => 2,
+          ),
+        ),
+        'required' => 0,
+        'description' => 'If needed, you may use this space to add further detail to the refund scenario.',
+        'default_value' => NULL,
+        'field_name' => 'field_refund_explanation',
+        'entity_type' => 'commerce_payment_transaction',
+        'bundle' => $bundle_name,
+      );
+      field_create_instance($instance);
+    }
+  }
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function commerce_custom_refunds_uninstall() {
+  // Clean up the field info instances on uninstall.
+  $bundles = array('store_credit_refund', 'credit_accounts', 'paypal_wpp', 'paypal_ec');
+  $fields = array('field_refunded_line_item', 'field_refund_reason', 'field_refund_explanation');
+  foreach ($bundles as $bundle) {
+    foreach ($fields as $field) {
+      if ($instance = field_info_instance('commerce_payment_transaction', $field, $bundle)) {
+        field_delete_instance($instance);
+      }
+    }
+  }
+}
